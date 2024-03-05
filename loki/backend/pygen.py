@@ -123,13 +123,29 @@ class PyCodegen(Stringifier):
                 ...spec without imports and only declarations with initial values...
                 ...body...
         """
+        
+        # identify if we have gt4py from docstring 
+        with_gt4py=False
+        if o.docstring:
+            with_gt4py=o.docstring[0].text.startswith('!->gt4py')
+
+        # gt4py header
+        if with_gt4py:
+            header=['# -*- coding: utf-8 -*-','from __future__ import annotations','from gt4py.cartesian.gtscript import Field, IJ, K']
+        else:
+            header=[]
+        
         # Some boilerplate imports...
         standard_imports = ['numpy as np']
-        header = [self.format_line('import ', name) for name in standard_imports]
+        header += [self.format_line('import ', name) for name in standard_imports]
 
         # ...and imports from the spec
         # TODO
 
+        # gt4py decorator
+        if with_gt4py:
+            header += ['from ifs_physics_common.framework.stencil import stencil_collection','@stencil_collection("%s")'%o.name.lower()]
+        
         # Generate header with argument signature
         # Note: we skip scalar out arguments and add a return statement for those below
         scalar_args = [a for a in o.arguments if isinstance(a, sym.Scalar)]
@@ -144,10 +160,14 @@ class PyCodegen(Stringifier):
                 dtype = self.visit(arg.type, **kwargs)
                 arg_str += [f'{arg.name}: {dtype}']
         header += [self.format_line('def ', o.name, '(', self.join_items(arg_str), '):')]
+        
+        self.depth += 1
+
+        # add docstring
+        header += [self.visit(dd) for dd in o.docstring]
 
         # ...and generate the spec without imports and only declarations for variables that
         # either are local arrays or are assigned an initial value
-        self.depth += 1
         body = [self.visit(o.spec, **kwargs)]
 
         # Fill the body
@@ -155,7 +175,7 @@ class PyCodegen(Stringifier):
 
         # Add return statement for scalar out arguments and close everything off
         ret_args = [arg for arg in o.arguments if arg in inout_args + out_args]
-        body += [self.format_line('return ', self.join_items(self.visit_all(ret_args, **kwargs)))]
+        body += [self.format_line('return ', self.join_items(self.visit_all(ret_args, gt4py=with_gt4py, **kwargs)))]
         self.depth -= 1
 
         return self.join_lines(*header, *body)
@@ -174,6 +194,13 @@ class PyCodegen(Stringifier):
         """
         text = o.text or o.source.string
         text = str(text).lstrip().replace('!', '#', 1)
+        
+        #print(text)
+        # daand: put some custom stuff here for gt4py
+        if text.startswith("#->gt4py"):
+            text=text.replace('#->gt4py ','')
+        #    raise Exception('Work in progress!')
+        
         return self.format_line(text, no_wrap=True)
 
     def visit_CommentBlock(self, o, **kwargs):

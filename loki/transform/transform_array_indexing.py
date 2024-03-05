@@ -47,7 +47,9 @@ def shift_to_zero_indexing(routine):
                     # no shift for stop because Python ranges are [start, stop)
                     new_dims += [sym.RangeIndex((start, d.stop, d.step))]
                 else:
-                    new_dims += [d - sym.Literal(1)]
+                    # daand: put simplify here to get stencil indices like [0,0] instead of [1-1,1-1]
+                    # new_dims += [d - sym.Literal(1)]
+                    new_dims += [simplify(d - sym.Literal(1))]
             vmap[v] = v.clone(dimensions=as_tuple(new_dims))
     routine.body = SubstituteExpressions(vmap).visit(routine.body)
 
