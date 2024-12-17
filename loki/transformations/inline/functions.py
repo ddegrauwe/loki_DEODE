@@ -142,6 +142,8 @@ def _inline_functions(routine, inline_elementals_only=False, functions=None):
     if functions is not None and not functions:
         return False
     functions = as_tuple(functions)
+    
+    print(functions)
 
     # Keep track of removed symbols
     removed_functions = set()

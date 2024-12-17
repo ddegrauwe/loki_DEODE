@@ -23,6 +23,8 @@ from loki.transformations.utilities import (
     single_variable_declaration, recursive_expression_map_update
 )
 
+from loki.backend import fgen
+
 
 __all__ = [
     'inline_internal_procedures', 'inline_member_procedures',
@@ -228,6 +230,10 @@ def inline_subroutine_calls(routine, calls, callee, allowed_aliases=None):
 
     # Find and apply symbol remappings for array size expressions
     symbol_map = dict(ChainMap(*[call.arg_map for call in calls]))
+    # add symbols without dimensions; otherwise they are ignored
+    kk=[k for k in symbol_map]
+    for k in kk:
+      symbol_map[k.clone(dimensions=None)]=symbol_map[k]
     decls = SubstituteExpressions(symbol_map).visit(decls)
 
     routine.spec.append(decls)
@@ -304,7 +310,7 @@ def inline_marked_subroutines(routine, allowed_aliases=None, adjust_imports=True
         Adjust imports by removing the symbol of the inlined routine or adding
         imports needed by the imported routine (optional, default: True)
     """
-
+    
     with pragmas_attached(routine, node_type=CallStatement):
 
         # Group the marked calls by callee routine
@@ -372,6 +378,8 @@ def inline_marked_subroutines(routine, allowed_aliases=None, adjust_imports=True
                     if not all(s in _m.symbols for s in impt.symbols):
                         new_symbols = tuple(s.rescope(routine) for s in impt.symbols)
                         import_map[m] = m.clone(symbols=tuple(set(_m.symbols + new_symbols)))
+                    if not impt.symbols or not _m.symbols:
+                        import_map[m] = m.clone(symbols=())
 
         # Finally, apply the import remapping
         routine.spec = Transformer(import_map).visit(routine.spec)
