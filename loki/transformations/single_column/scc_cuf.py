@@ -21,7 +21,7 @@ from loki.types import BasicType, DerivedType
 from loki.scope import SymbolAttributes
 
 from loki.transformations.hoist_variables import HoistVariablesTransformation
-from loki.transformations.sanitise import resolve_associates
+from loki.transformations.sanitise import do_resolve_associates
 from loki.transformations.single_column.base import SCCBaseTransformation
 from loki.transformations.single_column.vector import SCCDevectorTransformation
 from loki.transformations.utilities import single_variable_declaration
@@ -291,11 +291,9 @@ class SccLowLevelLaunchConfiguration(Transformation):
         # find vertical and block loops and replace with implicit "loops"
         loop_map = {}
         for loop in FindNodes(ir.Loop).visit(routine.body):
-            if loop.variable == self.block_dim.index or loop.variable.name.lower()\
-                    in [_.lower() for _ in self.block_dim._aliases]:
+            if loop.variable == self.block_dim.index or loop.variable.name in self.block_dim.sizes:
                 loop_map[loop] = loop.body
-            if loop.variable == self.horizontal.index or loop.variable.name.lower()\
-                    in [_.lower() for _ in self.horizontal._aliases]:
+            if loop.variable == self.horizontal.index or loop.variable.name in self.horizontal.sizes:
                 loop_map[loop] = loop.body
         routine.body = Transformer(loop_map).visit(routine.body)
 
@@ -303,8 +301,8 @@ class SccLowLevelLaunchConfiguration(Transformation):
 
             ## bit hacky ...
             assignments = FindNodes(ir.Assignment).visit(routine.body)
-            assignments2remove = [block_dim.index.lower()] + [_.lower() for _ in horizontal.bounds]
-            assignment_map = {assign: None for assign in assignments if assign.lhs.name.lower() in assignments2remove}
+            assignments2remove = as_tuple(block_dim.index) + horizontal.bounds
+            assignment_map = {assign: None for assign in assignments if assign.lhs.name in assignments2remove}
             routine.body = Transformer(assignment_map).visit(routine.body)
             ##end: bit hacky
 
@@ -344,14 +342,15 @@ class SccLowLevelLaunchConfiguration(Transformation):
                     if horizontal_index.name in call.routine.variables:
                         call.routine.symbol_attrs.update({horizontal_index.name:\
                                 call.routine.variable_map[horizontal_index.name].type.clone(intent='in')})
-                    additional_args += (horizontal_index.clone(),)
+                    additional_args += (horizontal_index.clone(type=horizontal_index.type.clone(intent='in'),
+                                                               scope=call.routine),)
                 if horizontal_index.name not in call.arg_map:
-                    additional_kwargs += ((horizontal_index.name, horizontal_index.clone()),)
+                    additional_kwargs += ((horizontal_index.name, horizontal_index.clone(scope=routine)),)
 
                 if block_dim_index.name not in call.routine.arguments:
                     additional_args += (block_dim_index.clone(type=block_dim_index.type.clone(intent='in',
                         scope=call.routine)),)
-                    additional_kwargs += ((block_dim_index.name, block_dim_index.clone()),)
+                    additional_kwargs += ((block_dim_index.name, block_dim_index.clone(scope=routine)),)
                 if additional_kwargs:
                     call._update(kwarguments=call.kwarguments+additional_kwargs)
                 if additional_args:
@@ -624,7 +623,7 @@ class SccLowLevelDataOffload(Transformation):
         """
 
         v_index = get_integer_variable(routine, name=self.horizontal.index)
-        resolve_associates(routine)
+        do_resolve_associates(routine)
         SCCBaseTransformation.resolve_masked_stmts(routine, loop_variable=v_index)
         SCCBaseTransformation.resolve_vector_dimension(routine, loop_variable=v_index, bounds=self.horizontal.bounds)
         SCCDevectorTransformation.kernel_remove_vector_loops(routine, self.horizontal)

@@ -12,7 +12,9 @@ from loki.frontend import (
     Frontend, parse_omni_source, parse_ofp_source, parse_fparser_source,
     RegexParserClass, preprocess_cpp, sanitize_input
 )
-from loki.ir import nodes as ir, FindNodes, Transformer
+from loki.ir import (
+    nodes as ir, FindNodes, Transformer, ExpressionTransformer
+)
 from loki.logging import debug
 from loki.scope import Scope
 from loki.tools import CaseInsensitiveDict, as_tuple, flatten
@@ -78,7 +80,7 @@ class ProgramUnit(Scope):
             if not isinstance(contains, ir.Section):
                 contains = ir.Section(body=as_tuple(contains))
             for node in contains.body:
-                if isinstance(node, ir.Intrinsic) and 'contains' in node.text.lower():
+                if isinstance(node, ir.Intrinsic) and 'contains' in node.text.lower():  # pylint: disable=no-member
                     break
                 if isinstance(node, ProgramUnit):
                     contains.prepend(ir.Intrinsic(text='CONTAINS'))
@@ -327,7 +329,8 @@ class ProgramUnit(Scope):
         """
         definitions_map = CaseInsensitiveDict((r.name, r) for r in as_tuple(definitions))
 
-        for imprt in self.imports:
+        # Enrich type info from all known imports (including parent scopes)
+        for imprt in self.all_imports:
             if not (module := definitions_map.get(imprt.module)):
                 # Skip modules that are not available in the definitions list
                 continue
@@ -349,14 +352,17 @@ class ProgramUnit(Scope):
                 # Take care of renaming upon import
                 local_name = symbol.name
                 remote_name = symbol.type.use_name or local_name
-                remote_node = module[remote_name]
+                try:
+                    remote_node = module[remote_name]
+                except KeyError:
+                    remote_node = None
 
-                if hasattr(remote_node, 'procedure_type'):
+                if remote_node and hasattr(remote_node, 'procedure_type'):
                     # This is a subroutine/function defined in the remote module
                     updated_symbol_attrs[local_name] = symbol.type.clone(
                         dtype=remote_node.procedure_type, imported=True, module=module
                     )
-                elif hasattr(remote_node, 'dtype'):
+                elif remote_node and hasattr(remote_node, 'dtype'):
                     # This is a derived type defined in the remote module
                     updated_symbol_attrs[local_name] = symbol.type.clone(
                         dtype=remote_node.dtype, imported=True, module=module
@@ -368,7 +374,7 @@ class ProgramUnit(Scope):
                         if getattr(type_.dtype, 'name') == remote_node.dtype.name
                     }
                     updated_symbol_attrs.update(variables_with_this_type)
-                elif hasattr(remote_node, 'type'):
+                elif remote_node and hasattr(remote_node, 'type'):
                     # This is a global variable or interface import
                     updated_symbol_attrs[local_name] = remote_node.type.clone(
                         imported=True, module=module, use_name=symbol.type.use_name
@@ -396,6 +402,9 @@ class ProgramUnit(Scope):
                 elif isinstance(attrs.dtype, DerivedType) and attrs.dtype.typedef is BasicType.DEFERRED:
                     updated_symbol_attrs[name] = attrs.clone(dtype=self.parent.symbol_attrs[name].dtype)
             self.symbol_attrs.update(updated_symbol_attrs)
+
+        # Rebuild local symbols to ensure correct symbol types
+        self.spec = ExpressionTransformer(inplace=True).visit(self.spec)
 
         if recurse:
             for routine in self.subroutines:

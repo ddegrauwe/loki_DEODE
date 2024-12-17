@@ -1094,6 +1094,34 @@ end subroutine add
         assert '#define' not in c_routine
         assert '#endif' not in c_routine
 
+@pytest.mark.parametrize('frontend', available_frontends())
+@pytest.mark.parametrize('codegen', (cgen, cppgen, cudagen))
+def test_transpile_routine_with_interface(tmp_path, frontend, codegen):
+    """
+    Test transpilation of 'INTERFACE's.
+    """
+
+    fcode = """
+subroutine some_routine_with_interf(a, b, result)
+  INTERFACE
+    SUBROUTINE KERNEL(a, b, c)
+      INTEGER, INTENT(INOUT) :: a, b, c
+    END SUBROUTINE KERNEL
+  END INTERFACE
+
+    real, intent(in) :: a, b
+    real, intent(out) :: result
+
+    result = a + b
+end subroutine some_routine_with_interf
+""".strip()
+
+    routine = Subroutine.from_source(fcode, frontend=frontend)
+    f2c = FortranCTransformation()
+    f2c.apply(source=routine, path=tmp_path)
+    c_routine = codegen(routine).lower()
+    assert 'interface' not in c_routine
+    assert 'kernel' not in c_routine
 
 @pytest.mark.parametrize('frontend', available_frontends())
 @pytest.mark.parametrize('f_type', ['integer', 'real'])
@@ -1344,6 +1372,50 @@ end subroutine transpile_special_functions
         fc_function(in_var, out_var)
         assert int(out_var) == expected_results[i]
 
+@pytest.mark.parametrize('frontend', available_frontends())
+def test_transpile_interface_to_module(tmp_path, frontend):
+    driver_fcode = """
+SUBROUTINE driver_interface_to_module(a, b, c)
+  IMPLICIT NONE
+  INTERFACE
+    SUBROUTINE KERNEL(a, b, c)
+      INTEGER, INTENT(INOUT) :: a, b, c
+    END SUBROUTINE KERNEL
+  END INTERFACE
+  INTERFACE
+    SUBROUTINE KERNEL2(a, b)
+      INTEGER, INTENT(INOUT) :: a, b
+    END SUBROUTINE KERNEL2
+  END INTERFACE
+  INTERFACE
+    SUBROUTINE KERNEL3(a)
+      INTEGER, INTENT(INOUT) :: a
+    END SUBROUTINE KERNEL3
+  END INTERFACE
+
+  INTEGER, INTENT(INOUT) :: a, b, c
+
+  CALL kernel(a, b ,c)
+  CALL kernel2(a, b)
+END SUBROUTINE driver_interface_to_module
+    """.strip()
+
+    routine = Subroutine.from_source(driver_fcode, frontend=frontend)
+
+    interfaces = FindNodes(ir.Interface).visit(routine.spec)
+    imports = FindNodes(ir.Import).visit(routine.spec)
+    assert len(interfaces) == 3
+    assert not imports
+
+    f2c = FortranCTransformation()
+    f2c.apply(source=routine, path=tmp_path, targets=('kernel',), role='driver')
+
+    assert len(routine.interfaces) == 2
+    imports = routine.imports
+    assert len(imports) == 1
+    assert imports[0].module.upper() == 'KERNEL_FC_MOD'
+    assert imports[0].symbols == ('KERNEL_FC',)
+
 
 @pytest.fixture(scope='module', name='horizontal')
 def fixture_horizontal():
@@ -1406,12 +1478,23 @@ def test_scc_cuda_parametrise(tmp_path, here, frontend, config, horizontal, vert
     f2c_transformation = FortranCTransformation(path=tmp_path, language='cuda', use_c_ptr=True)
     scheduler.process(transformation=f2c_transformation)
 
+    kernel = scheduler['kernel_mod#kernel'].ir
+    kernel_variable_map = kernel.variable_map
+    assert kernel_variable_map[horizontal.index].type.intent is None
+    assert kernel_variable_map[horizontal.index].scope == kernel
+    device = scheduler['kernel_mod#device'].ir
+    device_variable_map = device.variable_map
+    assert device_variable_map[horizontal.index].type.intent.lower() == 'in'
+    assert device_variable_map[horizontal.index].scope == device
+
     fc_kernel = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_fc.F90'))
     c_kernel = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c.c'))
     c_kernel_header = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c.h'))
     c_kernel_launch = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c_launch.h'))
     c_device = remove_whitespace_linebreaks(read_file(tmp_path/'device_c.c'))
     c_elemental_device = remove_whitespace_linebreaks(read_file(tmp_path/'elemental_device_c.c'))
+    c_some_func = remove_whitespace_linebreaks(read_file(tmp_path/'some_func_c.c'))
+    c_some_func_header = remove_whitespace_linebreaks(read_file(tmp_path/'some_func_c.h'))
 
     calls = FindNodes(ir.CallStatement).visit(scheduler["driver_mod#driver"].ir.body)
     assert len(calls) == 3
@@ -1431,9 +1514,13 @@ def test_scc_cuda_parametrise(tmp_path, here, frontend, config, horizontal, vert
     assert '#include"kernel_c_launch.h"' in c_kernel
     assert 'include"elemental_device_c.h"' in c_kernel
     assert 'include"device_c.h"' in c_kernel
+    assert 'include"some_func_c.h"' in c_kernel
     assert '__global__voidkernel_c' in c_kernel
     assert 'jl=threadidx.x;' in c_kernel
     assert 'b=blockidx.x;' in c_kernel
+    assert 'device_c(' in c_kernel
+    assert 'elemental_device_c(' in c_kernel
+    assert '=some_func_c(' in c_kernel
     # kernel_c.h
     assert '__global__voidkernel_c' in c_kernel_header
     assert 'jl=threadidx.x;' not in c_kernel_header
@@ -1451,9 +1538,17 @@ def test_scc_cuda_parametrise(tmp_path, here, frontend, config, horizontal, vert
     assert '#include<cuda.h>' in c_device
     assert '#include<cuda_runtime.h>' in c_device
     assert '#include"device_c.h"' in c_device
+    # elemental_device_c.c
+    assert '__device__voiddevice_c(' in c_device
     assert '#include<cuda.h>' in c_elemental_device
     assert '#include<cuda_runtime.h>' in c_elemental_device
     assert '#include"elemental_device_c.h"' in c_elemental_device
+    # some_func_c.c
+    assert 'doublesome_func_c(doublea)' in c_some_func
+    assert 'returnsome_func' in c_some_func
+    # some_func_c.h
+    assert 'doublesome_func_c(doublea);' in c_some_func_header
+
 
 @pytest.mark.parametrize('frontend', available_frontends())
 def test_scc_cuda_hoist(tmp_path, here, frontend, config, horizontal, vertical, blocking):
@@ -1475,12 +1570,23 @@ def test_scc_cuda_hoist(tmp_path, here, frontend, config, horizontal, vertical, 
     f2c_transformation = FortranCTransformation(path=tmp_path, language='cuda', use_c_ptr=True)
     scheduler.process(transformation=f2c_transformation)
 
+    kernel = scheduler['kernel_mod#kernel'].ir
+    kernel_variable_map = kernel.variable_map
+    assert kernel_variable_map[horizontal.index].type.intent is None
+    assert kernel_variable_map[horizontal.index].scope == kernel
+    device = scheduler['kernel_mod#device'].ir
+    device_variable_map = device.variable_map
+    assert device_variable_map[horizontal.index].type.intent.lower() == 'in'
+    assert device_variable_map[horizontal.index].scope == device
+
     fc_kernel = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_fc.F90'))
     c_kernel = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c.c'))
     c_kernel_header = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c.h'))
     c_kernel_launch = remove_whitespace_linebreaks(read_file(tmp_path/'kernel_c_launch.h'))
     c_device = remove_whitespace_linebreaks(read_file(tmp_path/'device_c.c'))
     c_elemental_device = remove_whitespace_linebreaks(read_file(tmp_path/'elemental_device_c.c'))
+    c_some_func = remove_whitespace_linebreaks(read_file(tmp_path/'some_func_c.c'))
+    c_some_func_header = remove_whitespace_linebreaks(read_file(tmp_path/'some_func_c.h'))
 
     calls = FindNodes(ir.CallStatement).visit(scheduler["driver_mod#driver"].ir.body)
     assert len(calls) == 3
@@ -1501,9 +1607,13 @@ def test_scc_cuda_hoist(tmp_path, here, frontend, config, horizontal, vertical, 
     assert '#include"kernel_c_launch.h"' in c_kernel
     assert '#include"elemental_device_c.h"' in c_kernel
     assert '#include"device_c.h"' in c_kernel
+    assert 'include"some_func_c.h"' in c_kernel
     assert '__global__voidkernel_c' in c_kernel
     assert 'jl=threadidx.x;' in c_kernel
     assert 'b=blockidx.x;' in c_kernel
+    assert 'device_c(' in c_kernel
+    assert 'elemental_device_c(' in c_kernel
+    assert '=some_func_c(' in c_kernel
     # kernel_c.h
     assert '__global__voidkernel_c' in c_kernel_header
     assert 'jl=threadidx.x;' not in c_kernel_header
@@ -1521,10 +1631,16 @@ def test_scc_cuda_hoist(tmp_path, here, frontend, config, horizontal, vertical, 
     assert '#include<cuda.h>' in c_device
     assert '#include<cuda_runtime.h>' in c_device
     assert '#include"device_c.h"' in c_device
+    assert '__device__voiddevice_c(' in c_device
     # elemental_device_c.c
     assert '#include<cuda.h>' in c_elemental_device
     assert '#include<cuda_runtime.h>' in c_elemental_device
     assert '#include"elemental_device_c.h"' in c_elemental_device
+    # some_func_c.c
+    assert 'doublesome_func_c(doublea)' in c_some_func
+    assert 'returnsome_func' in c_some_func
+    # some_func_c.h
+    assert 'doublesome_func_c(doublea);' in c_some_func_header
 
 
 @pytest.mark.parametrize('frontend', available_frontends())

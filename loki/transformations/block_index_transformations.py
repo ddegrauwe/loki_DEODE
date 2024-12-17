@@ -18,7 +18,7 @@ from loki.types import SymbolAttributes, BasicType
 from loki.expression import (
     symbols as sym, Variable, Array, RangeIndex
 )
-from loki.transformations.sanitise import resolve_associates
+from loki.transformations.sanitise import do_resolve_associates
 from loki.transformations.utilities import (
     recursive_expression_map_update, get_integer_variable,
     get_loop_bounds, check_routine_sequential
@@ -216,7 +216,7 @@ class BlockViewToFieldViewTransformation(Transformation):
             if call.name in targets:
                 _args = {a: d for d, a in call.arg_map.items() if isinstance(d, Array)}
                 _vars += [a for a, d in _args.items()
-                         if any(v in d.shape for v in self.horizontal.size_expressions) and a.parents]
+                          if any(v in d.shape for v in self.horizontal.sizes) and a.parents]
 
         # replace per-block view pointers with full field pointers
         vmap = {var: var.clone(name=var.name_parts[-1] + '_FIELD',
@@ -242,7 +242,7 @@ class BlockViewToFieldViewTransformation(Transformation):
     def process_kernel(self, routine, item, successors, targets, exclude_arrays):
 
         # Sanitize the subroutine
-        resolve_associates(routine)
+        do_resolve_associates(routine)
         v_index = get_integer_variable(routine, name=self.horizontal.index)
         SCCBaseTransformation.resolve_masked_stmts(routine, loop_variable=v_index)
 
@@ -375,7 +375,7 @@ class InjectBlockIndexTransformation(Transformation):
         variable_map = routine.variable_map
         if (block_index := variable_map.get(self.block_dim.index, None)):
             return block_index
-        if (block_index := [i for i in self.block_dim.index_expressions
+        if (block_index := [i for i in self.block_dim.indices
                             if i.split('%', maxsplit=1)[0] in variable_map]):
             return routine.resolve_typebound_var(block_index[0], variable_map)
         return None
@@ -521,8 +521,8 @@ class LowerBlockIndexTransformation(Transformation):
         """
         processed_routines = ()
         variable_map = routine.variable_map
-        block_dim_index = variable_map[self.block_dim.index]
-        block_dim_size = variable_map[self.block_dim.size]
+        block_dim_index = get_integer_variable(routine, self.block_dim.index)
+        block_dim_size = get_integer_variable(routine, self.block_dim.size)
         for call in FindNodes(ir.CallStatement).visit(routine.body):
             if str(call.name).lower() not in targets:
                 continue
@@ -690,8 +690,7 @@ class LowerBlockLoopTransformation(Transformation):
         with pragma_regions_attached(routine):
             with pragmas_attached(routine, ir.Loop):
                 loops = FindNodes(ir.Loop).visit(routine.body)
-                loops = [loop for loop in loops if loop.variable == self.block_dim.index
-                        or loop.variable in self.block_dim._index_aliases]
+                loops = [loop for loop in loops if loop.variable in self.block_dim.indices]
 
                 # Remove parallel regions around block loops
                 pragma_region_map = {}

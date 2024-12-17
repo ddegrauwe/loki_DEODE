@@ -18,7 +18,7 @@ from loki.expression import (
 from loki.ir import (
     Section, Import, Intrinsic, Interface, CallStatement,
     VariableDeclaration, TypeDef, Assignment, Transformer, FindNodes,
-    Pragma, Comment, SubstituteExpressions
+    Pragma, Comment, SubstituteExpressions, FindInlineCalls
 )
 from loki.logging import debug
 from loki.module import Module
@@ -35,7 +35,7 @@ from loki.transformations.array_indexing import (
 from loki.transformations.utilities import (
     convert_to_lower_case, replace_intrinsics, sanitise_imports
 )
-from loki.transformations.sanitise import resolve_associates
+from loki.transformations.sanitise import do_resolve_associates
 from loki.transformations.inline import (
     inline_constant_parameters, inline_elemental_functions
 )
@@ -182,15 +182,15 @@ class FortranCTransformation(Transformation):
             depth = depths[item]
 
         if role == 'driver':
+            self.interface_to_import(routine, targets)
             return
 
         for arg in routine.arguments:
             if isinstance(arg.type.dtype, DerivedType):
                 self.c_structs[arg.type.dtype.name.lower()] = self.c_struct_typedef(arg.type)
 
-        for call in FindNodes(CallStatement).visit(routine.body):
-            if str(call.name).lower() in as_tuple(targets):
-                call.convert_kwargs_to_args()
+        # for calls and inline calls: convert kwarguments to arguments
+        self.convert_kwargs_to_args(routine, targets)
 
         if role == 'kernel':
             # Generate Fortran wrapper module
@@ -230,6 +230,42 @@ class FortranCTransformation(Transformation):
                                path=self.c_path)
             header_path = (path/c_kernel.name.lower()).with_suffix('.h')
             Sourcefile.to_file(source=self.codegen(c_kernel, header=True), path=header_path)
+
+    def convert_kwargs_to_args(self, routine, targets):
+        # calls (to subroutines)
+        for call in as_tuple(FindNodes(CallStatement).visit(routine.body)):
+            if str(call.name).lower() in as_tuple(targets):
+                call.convert_kwargs_to_args()
+        # inline calls (to functions)
+        inline_call_map = {}
+        for inline_call in as_tuple(FindInlineCalls().visit(routine.body)):
+            if str(inline_call.name).lower() in as_tuple(targets) and inline_call.routine is not BasicType.DEFERRED:
+                inline_call_map[inline_call] = inline_call.clone_with_kwargs_as_args()
+        if inline_call_map:
+            routine.body = SubstituteExpressions(inline_call_map).visit(routine.body)
+
+    def interface_to_import(self, routine, targets):
+        """
+        Convert interface to import.
+        """
+        for call in FindNodes(CallStatement).visit(routine.body):
+            if str(call.name).lower() in as_tuple(targets):
+                call.convert_kwargs_to_args()
+        intfs = FindNodes(Interface).visit(routine.spec)
+        removal_map = {}
+        for i in intfs:
+            for s in i.symbols:
+                if targets and s in targets:
+                    # Create a new module import with explicitly qualified symbol
+                    new_symbol = s.clone(name=f'{s.name}_FC', scope=routine)
+                    modname = f'{new_symbol.name}_MOD'
+                    new_import = Import(module=modname, c_import=False, symbols=(new_symbol,))
+                    routine.spec.prepend(new_import)
+                    # Mark current import for removal
+                    removal_map[i] = None
+        # Apply any scheduled interface removals to spec
+        if removal_map:
+            routine.spec = Transformer(removal_map).visit(routine.spec)
 
     def c_struct_typedef(self, derived):
         """
@@ -608,7 +644,7 @@ class FortranCTransformation(Transformation):
         kernel.spec = Transformer(intrinsic_map).visit(kernel.spec)
 
         # Resolve implicit struct mappings through "associates"
-        resolve_associates(kernel)
+        do_resolve_associates(kernel)
 
         # Force all variables to lower-caps, as C/C++ is case-sensitive
         convert_to_lower_case(kernel)
@@ -627,6 +663,9 @@ class FortranCTransformation(Transformation):
         # apply dereference and reference where necessary
         self.apply_de_reference(kernel)
 
+        # adapt call and inline call names -> '<call name>_c'
+        self.convert_call_names(kernel, targets)
+
         symbol_map = {'epsilon': 'DBL_EPSILON'}
         function_map = {'min': 'fmin', 'max': 'fmax', 'abs': 'fabs',
                         'exp': 'exp', 'sqrt': 'sqrt', 'sign': 'copysign'}
@@ -636,6 +675,20 @@ class FortranCTransformation(Transformation):
         sanitise_imports(kernel)
 
         return kernel
+
+    def convert_call_names(self, routine, targets):
+        # calls (to subroutines)
+        calls = FindNodes(CallStatement).visit(routine.body)
+        for call in calls:
+            if call.name not in as_tuple(targets):
+                continue
+            call._update(name=Variable(name=f'{call.name}_c'.lower()))
+        # inline calls (to functions)
+        callmap = {}
+        for call in FindInlineCalls(unique=False).visit(routine.body):
+            if call.routine is not BasicType.DEFERRED and (targets is None or call.name in as_tuple(targets)):
+                callmap[call.function] = call.function.clone(name=f'{call.name}_c')
+        routine.body = SubstituteExpressions(callmap).visit(routine.body)
 
     def generate_c_kernel_launch(self, kernel_launch, kernel, **kwargs):
         import_map = {}

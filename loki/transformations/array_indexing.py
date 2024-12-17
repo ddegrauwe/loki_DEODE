@@ -19,7 +19,7 @@ from loki.analyse import dataflow_analysis_attached
 from loki.expression import symbols as sym, simplify, symbolic_op, is_constant
 from loki.ir import (
     nodes as ir, Assignment, Loop, VariableDeclaration, FindNodes,
-    Transformer, FindVariables, SubstituteExpressions
+    Transformer, FindVariables, SubstituteExpressions, FindInlineCalls
 )
 from loki.tools import as_tuple, CaseInsensitiveDict
 from loki.types import SymbolAttributes, BasicType
@@ -46,21 +46,40 @@ def remove_explicit_array_dimensions(routine, calls_only=False):
     ----------
     routine: :any:`Subroutine`
         The subroutine to check
+    calls_only: bool
+        Whether to remove colon notation from array dimensions only
+        from arrays within (inline) calls or all arrays (default: False)
     """
     if calls_only:
+        # handle calls (to subroutines) and inline calls (to functions)
         calls = FindNodes(ir.CallStatement).visit(routine.body)
-        for call in calls:
+        inline_calls = FindInlineCalls().visit(routine.body)
+        inline_call_map = {}
+        for call in as_tuple(calls) + as_tuple(inline_calls):
+            # handle arguments
             arguments = ()
             for arg in call.arguments:
-                if isinstance(arg, sym.Array):
-                    if all(dim == sym.RangeIndex((None, None)) for dim in arg.dimensions):
-                        new_dimensions = None
-                        arguments += (arg.clone(dimensions=new_dimensions),)
-                    else:
-                        arguments += (arg,)
+                if isinstance(arg, sym.Array) and all(dim == sym.RangeIndex((None, None)) for dim in arg.dimensions):
+                    new_dimensions = None
+                    arguments += (arg.clone(dimensions=new_dimensions),)
                 else:
                     arguments += (arg,)
-            call._update(arguments=arguments)
+            # handle kwargs
+            kwarguments = ()
+            for (kwarg_name, kwarg) in call.kwarguments:
+                if isinstance(kwarg, sym.Array) and all(dim==sym.RangeIndex((None, None)) for dim in kwarg.dimensions):
+                    kwarguments += ((kwarg_name, kwarg.clone(dimensions=None)),)
+                else:
+                    kwarguments += ((kwarg_name, kwarg),)
+            # distinguish calls and inline calls
+            if isinstance(call, sym.InlineCall):
+                inline_call_map[call] = call.clone(parameters=arguments, kw_parameters=kwarguments)
+            else:
+                # directly update calls
+                call._update(arguments=arguments, kwarguments=kwarguments)
+        if inline_call_map:
+            # update inline calls via expression substitution
+            routine.body = SubstituteExpressions(inline_call_map).visit(routine.body)
     else:
         arrays = [var for var in FindVariables(unique=False).visit(routine.body) if isinstance(var, sym.Array)]
         array_map = {}
@@ -177,9 +196,11 @@ def resolve_vector_notation(routine):
             ivar_basename = f'i_{stmt.lhs.basename}'
             for i, dim, s in zip(count(), v.dimensions, as_tuple(v.shape)):
                 if isinstance(dim, sym.RangeIndex):
+                    # use the shape for e.g., `ARR(:)`, but use the dimension for e.g., `ARR(2:5)`
+                    _s = dim if dim.lower is not None else s
                     # create tuple to test whether an appropriate loop is already available
-                    test_range = (sym.IntLiteral(1), s, 1) if not isinstance(s, sym.RangeIndex)\
-                            else (s.lower, s.upper, 1)
+                    test_range = (sym.IntLiteral(1), _s, 1) if not isinstance(_s, sym.RangeIndex)\
+                            else (_s.lower, _s.upper, 1)
                     # actually test for it
                     if test_range in loop_map:
                         # Use index variable of available matching loop
@@ -189,7 +210,7 @@ def resolve_vector_notation(routine):
                         vtype = SymbolAttributes(BasicType.INTEGER)
                         ivar = sym.Variable(name=f'{ivar_basename}_{i}', type=vtype, scope=routine)
                     shape_index_map[(i, s)] = ivar
-                    index_range_map[ivar] = s
+                    index_range_map[ivar] = _s
 
                     if ivar not in vdims:
                         vdims.append(ivar)

@@ -26,6 +26,7 @@ from loki.module import Module
 from loki.subroutine import Subroutine
 from loki.tools import CaseInsensitiveDict, as_tuple
 from loki.types import SymbolAttributes, BasicType, DerivedType, ProcedureType
+from loki.config import config_override
 
 
 __all__ = [
@@ -98,7 +99,7 @@ def convert_to_lower_case(routine):
     }
 
     # Capture nesting by applying map to itself before applying to the routine
-    vmap = recursive_expression_map_update(vmap)
+    vmap = recursive_expression_map_update(vmap, case_sensitive=True)
     routine.body = SubstituteExpressions(vmap).visit(routine.body)
     routine.spec = SubstituteExpressions(vmap).visit(routine.spec)
 
@@ -472,7 +473,8 @@ def replace_selected_kind(routine):
             routine.spec.prepend(imprt)
 
 
-def recursive_expression_map_update(expr_map, max_iterations=10, mapper_cls=SubstituteExpressionsMapper):
+def recursive_expression_map_update(expr_map, max_iterations=10, mapper_cls=SubstituteExpressionsMapper,
+                                    case_sensitive=None):
     """
     Utility function to apply a substitution map for expressions to itself
 
@@ -496,6 +498,9 @@ def recursive_expression_map_update(expr_map, max_iterations=10, mapper_cls=Subs
         nesting that can be replaced.
     mapper_cls: :any:`SubstituteExpressionsMapper`
        The underlying mapper to be used (default: :any:`SubstituteExpressionsMapper`).
+    case_sensitive: bool (optional)
+        Whether to check w/o case-sensitiviy for early termination opportunities
+        (default: None, use the default/global case-sensitivy setting).
     """
     def apply_to_init_arg(name, arg, expr, mapper):
         # Helper utility to apply the mapper only to expression arguments and
@@ -510,7 +515,11 @@ def recursive_expression_map_update(expr_map, max_iterations=10, mapper_cls=Subs
         # We update the expression map by applying it to the children of each replacement
         # node, thus making sure node replacements are also applied to nested attributes,
         # e.g. call arguments or array subscripts etc.
-        mapper = mapper_cls(expr_map)
+        if issubclass(mapper_cls, SubstituteExpressionsMapper):
+            # Need to check if we should pass the `expr_map` argument
+            mapper = mapper_cls(expr_map)
+        else:
+            mapper = mapper_cls()
         prev_map, expr_map = expr_map, {
             expr: type(replacement)(**{
                 name: apply_to_init_arg(name, arg, expr, mapper)
@@ -519,9 +528,12 @@ def recursive_expression_map_update(expr_map, max_iterations=10, mapper_cls=Subs
             for expr, replacement in expr_map.items()
         }
 
-        # Check for early termination opportunities
-        if prev_map == expr_map:
-            break
+        # Check for early termination opportunities, either with case-sensitivity
+        #  being the default (`{}`) or with the provided value (`case-sensitive`)
+        _case_sensitive = {'case-sensitive': case_sensitive} if case_sensitive is not None else {}
+        with config_override(_case_sensitive):
+            if prev_map == expr_map:
+                break
 
     return expr_map
 
@@ -559,8 +571,8 @@ def get_loop_bounds(routine, dimension):
 
     bounds = ()
     variable_map = routine.variable_map
-    for name, _bounds in zip(['start', 'end'], dimension.bounds_expressions):
-        for bound in _bounds:
+    for name, _bounds in zip(['start', 'end'], [dimension.lower, dimension.upper]):
+        for bound in as_tuple(_bounds):
             if bound.split('%', maxsplit=1)[0] in variable_map:
                 bounds += (routine.resolve_typebound_var(bound, variable_map),)
                 break

@@ -23,10 +23,6 @@ class FileWriteTransformation(Transformation):
 
     Parameters
     ----------
-    builddir : str or path
-        Directory for the output to be written to
-    mode : str, optional
-        "Mode" identifier string to add in front of the file suffix
     suffix : str, optional
         File suffix to determine file type for all written file. If
         omitted, it will preserve the original file type.
@@ -41,11 +37,9 @@ class FileWriteTransformation(Transformation):
     traverse_file_graph = True
 
     def __init__(
-            self, builddir=None, mode='loki', suffix=None, cuf=False,
+            self, suffix=None, cuf=False,
             include_module_var_imports=False
     ):
-        self.builddir = Path(builddir)
-        self.mode = mode
         self.suffix = suffix
         self.cuf = cuf
         self.include_module_var_imports = include_module_var_imports
@@ -57,21 +51,39 @@ class FileWriteTransformation(Transformation):
         imports are honoured in the :any:`Scheduler` traversal.
         """
         if self.include_module_var_imports:
-            return (ProcedureItem, ModuleItem) #GlobalVariableItem)
+            return (ProcedureItem, ModuleItem)
         return ProcedureItem
 
+    def _get_file_path(self, item, build_args):
+        if not item:
+            raise ValueError('No Item provided; required to determine file write path')
+
+        _mode = item.mode if item.mode else 'loki'
+        _mode = _mode.replace('-', '_')  # Sanitize mode string
+
+        path = Path(item.path)
+        suffix = self.suffix if self.suffix else path.suffix
+        sourcepath = Path(item.path).with_suffix(f'.{_mode}{suffix}')
+        if build_args and (output_dir := build_args.get('output_dir', None)) is not None:
+            sourcepath = Path(output_dir)/sourcepath.name
+        return sourcepath
+
     def transform_file(self, sourcefile, **kwargs):
-        item = kwargs.get('item', None)
+        item = kwargs.get('item')
         if not item and 'items' in kwargs:
             if kwargs['items']:
                 item = kwargs['items'][0]
 
-        if not item:
-            raise ValueError('No Item provided; required to determine file write path')
-
-        path = Path(item.path)
-        suffix = self.suffix if self.suffix else path.suffix
-        sourcepath = Path(item.path).with_suffix(f'.{self.mode}{suffix}')
-        if self.builddir is not None:
-            sourcepath = self.builddir/sourcepath.name
+        build_args = kwargs.get('build_args', {})
+        sourcepath = self._get_file_path(item, build_args)
         sourcefile.write(path=sourcepath, cuf=self.cuf)
+
+    def plan_file(self, sourcefile, **kwargs):  # pylint: disable=unused-argument
+        item = kwargs.get('item')
+        if not item and 'items' in kwargs:
+            if kwargs['items']:
+                item = kwargs['items'][0]
+
+        build_args = kwargs.get('build_args', {})
+        sourcepath = self._get_file_path(item, build_args)
+        item.trafo_data['FileWriteTransformation'] = {'path': sourcepath}

@@ -13,19 +13,19 @@ physics, including "Single Column" (SCA) and CLAW transformations.
 """
 
 from pathlib import Path
+import sys
 import click
 
 from loki import (
     config as loki_config, Sourcefile, Frontend, as_tuple,
-    set_excepthook, auto_post_mortem_debugger, info
+    set_excepthook, auto_post_mortem_debugger, info, warning
 )
-from loki.batch import Transformation, Pipeline, Scheduler, SchedulerConfig
+from loki.batch import Pipeline, Scheduler, SchedulerConfig, ProcessingStrategy
 
 # Get generalized transformations provided by Loki
 from loki.transformations.argument_shape import (
     ArgumentArrayShapeAnalysis, ExplicitArgumentArrayShapeTransformation
 )
-from loki.transformations.array_indexing import LowerConstantArrayIndices
 from loki.transformations.build_system import (
     DependencyTransformation, ModuleWrapTransformation, FileWriteTransformation
 )
@@ -34,7 +34,6 @@ from loki.transformations.data_offload import (
 )
 from loki.transformations.transform_derived_types import DerivedTypeArgumentsTransformation
 from loki.transformations.drhook import DrHookTransformation
-from loki.transformations.hoist_variables import HoistTemporaryArraysAnalysis
 from loki.transformations.idempotence import IdemTransformation
 from loki.transformations.inline import InlineTransformation
 from loki.transformations.pool_allocator import TemporariesPoolAllocatorTransformation
@@ -43,7 +42,6 @@ from loki.transformations.sanitise import SanitiseTransformation
 from loki.transformations.single_column import (
     ExtractSCATransformation, CLAWTransformation, SCCVectorPipeline,
     SCCHoistPipeline, SCCStackPipeline, SCCRawStackPipeline,
-    HoistTemporaryArraysDeviceAllocatableTransformation,
 )
 from loki.transformations.transpile import FortranCTransformation
 from loki.transformations.block_index_transformations import (
@@ -113,6 +111,12 @@ def cli(debug):
               help="Recursively derive explicit shape dimension for argument arrays")
 @click.option('--eliminate-dead-code/--no-eliminate-dead-code', default=True,
               help='Perform dead code elimination, where unreachable branches are trimmed from the code.')
+@click.option('--plan-file', type=click.Path(), default=None,
+              help='Process pipeline in planning mode and generate CMake "plan" file.')
+@click.option('--callgraph', '-g', type=click.Path(), default=None,
+              help='Generate and display the subroutine callgraph.')
+@click.option('--root', type=click.Path(), default=None,
+              help='Root path to which all paths are relative to.')
 @click.option('--log-level', '-l', default='info', envvar='LOKI_LOGGING',
               type=click.Choice(['debug', 'detail', 'perf', 'info', 'warning', 'error']),
               help='Log level to output during batch processing')
@@ -121,7 +125,7 @@ def convert(
         data_offload, remove_openmp, assume_deviceptr, frontend, trim_vector_sections,
         global_var_offload, remove_derived_args, inline_members, inline_marked,
         resolve_sequence_association, resolve_sequence_association_inlined_calls,
-        derive_argument_array_shape, eliminate_dead_code, log_level
+        derive_argument_array_shape, eliminate_dead_code, plan_file, callgraph, root, log_level
 ):
     """
     Batch-processing mode for Fortran-to-Fortran transformations that
@@ -136,9 +140,17 @@ def convert(
 
     loki_config['log-level'] = log_level
 
-    info(f'[Loki] Batch-processing source files using config: {config} ')
+    if plan_file is not None:
+        processing_strategy = ProcessingStrategy.PLAN
+        info(f'[Loki] Creating CMake plan file from config: {config}')
+    else:
+        processing_strategy = ProcessingStrategy.DEFAULT
+        info(f'[Loki] Batch-processing source files using config: {config} ')
 
     config = SchedulerConfig.from_file(config)
+
+    # set default transformation mode in Scheduler config
+    config.default['mode'] = mode
 
     directive = None if directive.lower() == 'none' else directive.lower()
 
@@ -169,7 +181,7 @@ def convert(
     paths = [Path(p).resolve() for p in as_tuple(source)]
     paths += [Path(h).resolve().parent for h in as_tuple(header)]
     scheduler = Scheduler(
-        paths=paths, config=config, frontend=frontend, definitions=definitions, **build_args
+        paths=paths, config=config, frontend=frontend, definitions=definitions, output_dir=build, **build_args
     )
 
     # If requested, apply a custom pipeline from the scheduler config
@@ -179,17 +191,28 @@ def convert(
         info(f'[Loki-transform] Applying custom pipeline {mode} from config:')
         info(str(config.pipelines[mode]))
 
-        scheduler.process( config.pipelines[mode] )
+        scheduler.process(config.pipelines[mode], proc_strategy=processing_strategy)
 
         mode = mode.replace('-', '_')  # Sanitize mode string
 
         # Write out all modified source files into the build directory
         file_write_trafo = scheduler.config.transformations.get('FileWriteTransformation', None)
         if not file_write_trafo:
-            file_write_trafo = FileWriteTransformation(builddir=build, mode=mode, cuf='cuf' in mode)
-        scheduler.process(transformation=file_write_trafo)
+            file_write_trafo = FileWriteTransformation(cuf='cuf' in mode)
+        scheduler.process(transformation=file_write_trafo, proc_strategy=processing_strategy)
+
+        if plan_file is not None:
+            scheduler.write_cmake_plan(plan_file, rootpath=root)
+
+        if callgraph:
+            scheduler.callgraph(callgraph)
 
         return
+
+    if plan_file is not None:
+        msg = '[Loki] ERROR: Plan mode requires a pipeline definition in the config file.\n'
+        msg += '[Loki] Please provide a config file with configured transformation or pipelines instead.\n'
+        sys.exit(msg)
 
     # If we do not use a custom pipeline, it should be one of the internally supported ones
     assert mode in [
@@ -197,6 +220,12 @@ def convert(
         'cuf-parametrise', 'cuf-hoist', 'cuf-dynamic', 'scc-raw-stack',
         'idem-lower', 'idem-lower-loop', 'cuda-parametrise', 'cuda-hoist'
     ]
+
+    # Add deprecation message to warn about future removal of non-config entry point.
+    # Once we're ready to force config-only mode, everything after this can go.
+    msg = '[Loki] [DEPRECATION WARNING] Custom entry points to loki-transform.py convert are deprecated.\n'
+    msg += '[Loki] Please provide a config file with configured transformation or pipelines instead.\n'
+    warning(msg)
 
     # Pull dimension definition from configuration
     horizontal = scheduler.config.dimensions.get('horizontal', None)
@@ -352,7 +381,7 @@ def convert(
                 transformation_type='hoist', derived_types = ['TECLDP'], block_dim=block_dim,
                 dim_vars=(vertical.size,), as_kwarguments=True, remove_vector_section=True)
         scheduler.process( pipeline )
-    
+
     if mode == 'cuf-parametrise':
         pipeline = scheduler.config.transformations.get('cuf-parametrise', None)
         if not pipeline:
@@ -406,8 +435,7 @@ def convert(
 
     # Write out all modified source files into the build directory
     scheduler.process(transformation=FileWriteTransformation(
-        builddir=build, mode=mode, cuf='cuf' in mode,
-        include_module_var_imports=global_var_offload
+        cuf='cuf' in mode, include_module_var_imports=global_var_offload
     ))
 
 
@@ -437,32 +465,16 @@ def convert(
 @click.option('--log-level', '-l', default='info', envvar='LOKI_LOGGING',
               type=click.Choice(['debug', 'detail', 'perf', 'info', 'warning', 'error']),
               help='Log level to output during batch processing')
+@click.pass_context
 def plan(
-         mode, config, header, source, build, root, cpp, directive,
+         ctx, mode, config, header, source, build, root, cpp, directive,
          frontend, callgraph, plan_file, log_level
 ):
     """
     Create a "plan", a schedule of files to inject and transform for a
     given configuration.
     """
-
-    loki_config['log-level'] = log_level
-
-    info(f'[Loki] Creating CMake plan file from config: {config}')
-    config = SchedulerConfig.from_file(config)
-
-    paths = [Path(s).resolve() for s in source]
-    paths += [Path(h).resolve().parent for h in header]
-    scheduler = Scheduler(paths=paths, config=config, frontend=frontend, full_parse=False, preprocess=cpp)
-
-    mode = mode.replace('-', '_')  # Sanitize mode string
-
-    # Construct the transformation plan as a set of CMake lists of source files
-    scheduler.write_cmake_plan(filepath=plan_file, mode=mode, buildpath=build, rootpath=root)
-
-    # Output the resulting callgraph
-    if callgraph:
-        scheduler.callgraph(callgraph)
+    return ctx.forward(convert)
 
 
 if __name__ == "__main__":
