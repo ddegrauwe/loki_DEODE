@@ -233,7 +233,7 @@ class TypedSymbol:
         """
         Update the stored type information
         """
-        if self._scope is None:
+        if self.scope is None:
             # Store locally if not attached to a scope
             self._type = _type
         elif _type is None:

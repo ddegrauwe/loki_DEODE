@@ -143,8 +143,6 @@ def _inline_functions(routine, inline_elementals_only=False, functions=None):
         return False
     functions = as_tuple(functions)
     
-    print(functions)
-
     # Keep track of removed symbols
     removed_functions = set()
 
@@ -172,6 +170,7 @@ def _inline_functions(routine, inline_elementals_only=False, functions=None):
     # inline functions
     node_prepend_map = {}
     call_map = {}
+    new_imports = ()
     for calls_nodes in function_calls.values():
         calls, nodes = list(zip(*calls_nodes))
         for call in calls:
@@ -179,6 +178,9 @@ def _inline_functions(routine, inline_elementals_only=False, functions=None):
         # collect nodes to be appendes as well as expression replacement for inline call
         inline_node_map, inline_call_map = inline_function_calls(routine, as_tuple(calls),
                                                                  calls[0].routine, as_tuple(nodes))
+        # imports from callee
+        new_imports+=calls[0].routine.imports
+        
         for node, nodes_to_prepend in inline_node_map.items():
             node_prepend_map.setdefault(node, []).extend(list(nodes_to_prepend))
         call_map.update(inline_call_map)
@@ -199,6 +201,10 @@ def _inline_functions(routine, inline_elementals_only=False, functions=None):
         if im.symbols and all(s.type.dtype in removed_functions for s in im.symbols):
             import_map[im] = None
     routine.spec = Transformer(import_map).visit(routine.spec)
+    
+    # add new imports
+    routine.spec.prepend(new_imports)
+
     return True
 
 
@@ -322,6 +328,10 @@ def inline_function_calls(routine, calls, callee, nodes, allowed_aliases=None):
 
     # Find and apply symbol remappings for array size expressions
     symbol_map = dict(ChainMap(*[call.arg_map for call in calls]))
+    # add symbols without dimensions; otherwise they are ignored
+    kk=[k for k in symbol_map]
+    for k in kk:
+      symbol_map[k.clone(dimensions=None)]=symbol_map[k]
     decls = SubstituteExpressions(symbol_map).visit(decls)
     routine.spec.append(decls)
 
